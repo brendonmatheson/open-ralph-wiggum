@@ -142,6 +142,9 @@ Options:
   --max-iterations N       Stop after N iterations (default: unlimited)
   --completion-promise T   Text that signals completion (default: COMPLETE)
   --model MODEL            OpenCode model to use
+  --prompt-file, --file, -f  Read prompt content from a file
+  --no-stream              Buffer OpenCode output and print at the end
+  --verbose-tools          Print every tool line (disable compact tool summary)
   --no-plugins             Disable non-auth OpenCode plugins for this run
   --no-commit              Don't auto-commit after iterations
   --help                   Show help
@@ -171,6 +174,15 @@ When the plugin is active, these tools are available in OpenCode:
 
 OpenCode is trying to load the npm package `ralph-wiggum`, which is a placeholder.
 Remove `ralph-wiggum` from your OpenCode `plugin` list (opencode.json), or run:
+
+```bash
+ralph "Your task" --no-plugins
+```
+
+### "Cannot find module '@opencode-ai/plugin'"
+
+OpenCode is loading the `@th0rgal/ralph-wiggum` npm package, but its dependencies aren't installed.
+Reinstall/upgrade the package so dependencies are present, or temporarily disable non-auth plugins:
 
 ```bash
 ralph "Your task" --no-plugins

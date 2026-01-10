@@ -1,6 +1,6 @@
 {
   "name": "@th0rgal/ralph-wiggum",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Ralph Wiggum technique for OpenCode - iterative AI development loops with self-correcting agents",
   "type": "module",
   "main": ".opencode/plugin/ralph-wiggum.ts",
@@ -12,6 +12,9 @@
     "build": "bun build ralph.ts --outfile bin/ralph --compile",
     "test": "bun test ./tests/ralph.test.ts",
     "install-local": "bun link"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.0.223"
   },
   "keywords": [
     "opencode",

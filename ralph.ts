@@ -7,10 +7,10 @@
  */
 
 import { $ } from "bun";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "fs";
 import { join } from "path";
 
-const VERSION = "1.0.0";
+const VERSION = "1.0.2";
 
 // Parse arguments
 const args = process.argv.slice(2);
@@ -21,6 +21,7 @@ Ralph Wiggum Loop - Iterative AI development with OpenCode
 
 Usage:
   ralph "<prompt>" [options]
+  ralph --prompt-file <path> [options]
 
 Arguments:
   prompt              Task description for the AI to work on
@@ -29,6 +30,9 @@ Options:
   --max-iterations N  Maximum iterations before stopping (default: unlimited)
   --completion-promise TEXT  Phrase that signals completion (default: COMPLETE)
   --model MODEL       Model to use (e.g., anthropic/claude-sonnet)
+  --prompt-file, --file, -f  Read prompt content from a file
+  --no-stream         Buffer OpenCode output and print at the end
+  --verbose-tools     Print every tool line (disable compact tool summary)
   --no-plugins        Disable non-auth OpenCode plugins for this run
   --no-commit         Don't auto-commit after each iteration
   --version, -v       Show version
@@ -38,6 +42,7 @@ Examples:
   ralph "Build a REST API for todos"
   ralph "Fix the auth bug" --max-iterations 10
   ralph "Add tests" --completion-promise "ALL TESTS PASS" --model openai/gpt-5.1
+  ralph --prompt-file ./prompt.md --max-iterations 5
 
 How it works:
   1. Sends your prompt to OpenCode
@@ -66,6 +71,10 @@ let completionPromise = "COMPLETE";
 let model = "";
 let autoCommit = true;
 let disablePlugins = false;
+let promptFile = "";
+let streamOutput = true;
+let verboseTools = false;
+let promptSource = "";
 
 const promptParts: string[] = [];
 
@@ -93,6 +102,19 @@ for (let i = 0; i < args.length; i++) {
       process.exit(1);
     }
     model = val;
+  } else if (arg === "--prompt-file" || arg === "--file" || arg === "-f") {
+    const val = args[++i];
+    if (!val) {
+      console.error("Error: --prompt-file requires a file path");
+      process.exit(1);
+    }
+    promptFile = val;
+  } else if (arg === "--no-stream") {
+    streamOutput = false;
+  } else if (arg === "--stream") {
+    streamOutput = true;
+  } else if (arg === "--verbose-tools") {
+    verboseTools = true;
   } else if (arg === "--no-commit") {
     autoCommit = false;
   } else if (arg === "--no-plugins") {
@@ -106,7 +128,43 @@ for (let i = 0; i < args.length; i++) {
   }
 }
 
-prompt = promptParts.join(" ");
+function readPromptFile(path: string): string {
+  if (!existsSync(path)) {
+    console.error(`Error: Prompt file not found: ${path}`);
+    process.exit(1);
+  }
+  try {
+    const stat = statSync(path);
+    if (!stat.isFile()) {
+      console.error(`Error: Prompt path is not a file: ${path}`);
+      process.exit(1);
+    }
+  } catch {
+    console.error(`Error: Unable to stat prompt file: ${path}`);
+    process.exit(1);
+  }
+  try {
+    const content = readFileSync(path, "utf-8");
+    if (!content.trim()) {
+      console.error(`Error: Prompt file is empty: ${path}`);
+      process.exit(1);
+    }
+    return content;
+  } catch {
+    console.error(`Error: Unable to read prompt file: ${path}`);
+    process.exit(1);
+  }
+}
+
+if (promptFile) {
+  promptSource = promptFile;
+  prompt = readPromptFile(promptFile);
+} else if (promptParts.length === 1 && existsSync(promptParts[0])) {
+  promptSource = promptParts[0];
+  prompt = readPromptFile(promptParts[0]);
+} else {
+  prompt = promptParts.join(" ");
+}
 
 if (!prompt) {
   console.error("Error: No prompt provided");
@@ -184,7 +242,7 @@ function ensureFilteredPluginsConfig(): string {
     ...loadPluginsFromConfig(userConfigPath),
     ...loadPluginsFromConfig(projectConfigPath),
   ];
-  const filtered = Array.from(new Set(plugins)).filter(p => p !== "ralph-wiggum");
+  const filtered = Array.from(new Set(plugins)).filter(p => /auth/i.test(p));
   writeFileSync(
     configPath,
     JSON.stringify(
@@ -246,6 +304,192 @@ function detectPlaceholderPluginError(output: string): boolean {
   return output.includes("ralph-wiggum is not yet ready for use. This is a placeholder package.");
 }
 
+function stripAnsi(input: string): string {
+  return input.replace(/\x1B\[[0-9;]*m/g, "");
+}
+
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  }
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatToolSummary(toolCounts: Map<string, number>, maxItems = 6): string {
+  if (!toolCounts.size) return "";
+  const entries = Array.from(toolCounts.entries()).sort((a, b) => b[1] - a[1]);
+  const shown = entries.slice(0, maxItems);
+  const remaining = entries.length - shown.length;
+  const parts = shown.map(([name, count]) => `${name} ${count}`);
+  if (remaining > 0) {
+    parts.push(`+${remaining} more`);
+  }
+  return parts.join(" • ");
+}
+
+function collectToolSummaryFromText(text: string): Map<string, number> {
+  const counts = new Map<string, number>();
+  const lines = text.split(/\r?\n/);
+  for (const line of lines) {
+    const match = stripAnsi(line).match(/^\|\s{2}([A-Za-z0-9_-]+)/);
+    if (match) {
+      const tool = match[1];
+      counts.set(tool, (counts.get(tool) ?? 0) + 1);
+    }
+  }
+  return counts;
+}
+
+function printIterationSummary(params: {
+  iteration: number;
+  elapsedMs: number;
+  toolCounts: Map<string, number>;
+  exitCode: number;
+  completionDetected: boolean;
+}): void {
+  const toolSummary = formatToolSummary(params.toolCounts);
+  console.log("\nIteration Summary");
+  console.log("────────────────────────────────────────────────────────────────────");
+  console.log(`Iteration: ${params.iteration}`);
+  console.log(`Elapsed:   ${formatDuration(params.elapsedMs)}`);
+  if (toolSummary) {
+    console.log(`Tools:     ${toolSummary}`);
+  } else {
+    console.log("Tools:     none");
+  }
+  console.log(`Exit code: ${params.exitCode}`);
+  console.log(`Completion promise: ${params.completionDetected ? "detected" : "not detected"}`);
+}
+
+async function streamProcessOutput(
+  proc: ReturnType<typeof Bun.spawn>,
+  options: {
+    compactTools: boolean;
+    toolSummaryIntervalMs: number;
+    heartbeatIntervalMs: number;
+    iterationStart: number;
+  },
+): Promise<{ stdoutText: string; stderrText: string; toolCounts: Map<string, number> }> {
+  const toolCounts = new Map<string, number>();
+  let stdoutText = "";
+  let stderrText = "";
+  let lastPrintedAt = Date.now();
+  let lastActivityAt = Date.now();
+  let lastToolSummaryAt = 0;
+
+  const compactTools = options.compactTools;
+
+  const maybePrintToolSummary = (force = false) => {
+    if (!compactTools || toolCounts.size === 0) return;
+    const now = Date.now();
+    if (!force && now - lastToolSummaryAt < options.toolSummaryIntervalMs) {
+      return;
+    }
+    const summary = formatToolSummary(toolCounts);
+    if (summary) {
+      console.log(`| Tools    ${summary}`);
+      lastPrintedAt = Date.now();
+      lastToolSummaryAt = Date.now();
+    }
+  };
+
+  const handleLine = (line: string, isError: boolean) => {
+    lastActivityAt = Date.now();
+    const match = stripAnsi(line).match(/^\|\s{2}([A-Za-z0-9_-]+)/);
+    if (compactTools && match) {
+      const tool = match[1];
+      toolCounts.set(tool, (toolCounts.get(tool) ?? 0) + 1);
+      maybePrintToolSummary();
+      return;
+    }
+    if (line.length === 0) {
+      console.log("");
+      lastPrintedAt = Date.now();
+      return;
+    }
+    if (isError) {
+      console.error(line);
+    } else {
+      console.log(line);
+    }
+    lastPrintedAt = Date.now();
+  };
+
+  const streamText = async (
+    stream: ReadableStream<Uint8Array> | null,
+    onText: (chunk: string) => void,
+    isError: boolean,
+  ) => {
+    if (!stream) return;
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const text = decoder.decode(value, { stream: true });
+      if (text.length > 0) {
+        onText(text);
+        buffer += text;
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          handleLine(line, isError);
+        }
+      }
+    }
+    const flushed = decoder.decode();
+    if (flushed.length > 0) {
+      onText(flushed);
+      buffer += flushed;
+    }
+    if (buffer.length > 0) {
+      handleLine(buffer, isError);
+    }
+  };
+
+  const heartbeatTimer = setInterval(() => {
+    const now = Date.now();
+    if (now - lastPrintedAt >= options.heartbeatIntervalMs) {
+      const elapsed = formatDuration(now - options.iterationStart);
+      const sinceActivity = formatDuration(now - lastActivityAt);
+      console.log(`⏳ working... elapsed ${elapsed} · last activity ${sinceActivity} ago`);
+      lastPrintedAt = now;
+    }
+  }, options.heartbeatIntervalMs);
+
+  try {
+    await Promise.all([
+      streamText(
+        proc.stdout,
+        chunk => {
+          stdoutText += chunk;
+        },
+        false,
+      ),
+      streamText(
+        proc.stderr,
+        chunk => {
+          stderrText += chunk;
+        },
+        true,
+      ),
+    ]);
+  } finally {
+    clearInterval(heartbeatTimer);
+  }
+
+  if (compactTools) {
+    maybePrintToolSummary(true);
+  }
+
+  return { stdoutText, stderrText, toolCounts };
+}
+
 // Main loop
 async function runRalphLoop(): Promise<void> {
   // Check if a loop is already running
@@ -277,7 +521,13 @@ async function runRalphLoop(): Promise<void> {
 
   saveState(state);
 
-  console.log(`Task: ${prompt.substring(0, 80)}${prompt.length > 80 ? "..." : ""}`);
+  const promptPreview = prompt.replace(/\s+/g, " ").substring(0, 80) + (prompt.length > 80 ? "..." : "");
+  if (promptSource) {
+    console.log(`Task: ${promptSource}`);
+    console.log(`Preview: ${promptPreview}`);
+  } else {
+    console.log(`Task: ${promptPreview}`);
+  }
   console.log(`Completion promise: ${completionPromise}`);
   console.log(`Max iterations: ${maxIterations > 0 ? maxIterations : "unlimited"}`);
   if (model) console.log(`Model: ${model}`);
@@ -329,6 +579,7 @@ async function runRalphLoop(): Promise<void> {
 
     // Build the prompt
     const fullPrompt = buildPrompt(state);
+    const iterationStart = Date.now();
 
     try {
       // Build command arguments
@@ -351,22 +602,50 @@ async function runRalphLoop(): Promise<void> {
       });
       const proc = currentProc;
 
-      const stdoutPromise = new Response(proc.stdout).text();
-      const stderrPromise = new Response(proc.stderr).text();
-      const [result, stderr, exitCode] = await Promise.all([
-        stdoutPromise,
-        stderrPromise,
-        proc.exited,
-      ]);
-      currentProc = null; // Clear reference after subprocess completes
+      const exitCodePromise = proc.exited;
+      let result = "";
+      let stderr = "";
+      let toolCounts = new Map<string, number>();
 
-      if (stderr) {
-        console.error(stderr);
+      if (streamOutput) {
+        const streamed = await streamProcessOutput(proc, {
+          compactTools: !verboseTools,
+          toolSummaryIntervalMs: 3000,
+          heartbeatIntervalMs: 10000,
+          iterationStart,
+        });
+        result = streamed.stdoutText;
+        stderr = streamed.stderrText;
+        toolCounts = streamed.toolCounts;
+      } else {
+        const stdoutPromise = new Response(proc.stdout).text();
+        const stderrPromise = new Response(proc.stderr).text();
+        [result, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+        toolCounts = collectToolSummaryFromText(`${result}\n${stderr}`);
       }
 
-      console.log(result);
+      const exitCode = await exitCodePromise;
+      currentProc = null; // Clear reference after subprocess completes
 
-      if (detectPlaceholderPluginError(stderr) || detectPlaceholderPluginError(result)) {
+      if (!streamOutput) {
+        if (stderr) {
+          console.error(stderr);
+        }
+        console.log(result);
+      }
+
+      const combinedOutput = `${result}\n${stderr}`;
+      const completionDetected = checkCompletion(combinedOutput, completionPromise);
+
+      printIterationSummary({
+        iteration: state.iteration,
+        elapsedMs: Date.now() - iterationStart,
+        toolCounts,
+        exitCode,
+        completionDetected,
+      });
+
+      if (detectPlaceholderPluginError(combinedOutput)) {
         console.error(
           "\n❌ OpenCode tried to load the npm plugin 'ralph-wiggum', which is a placeholder package.",
         );
@@ -384,7 +663,7 @@ async function runRalphLoop(): Promise<void> {
       }
 
       // Check for completion
-      if (checkCompletion(result, completionPromise)) {
+      if (completionDetected) {
         console.log(`\n╔══════════════════════════════════════════════════════════════════╗`);
         console.log(`║  ✅ Completion promise detected: <promise>${completionPromise}</promise>`);
         console.log(`║  Task completed in ${state.iteration} iteration(s)`);
