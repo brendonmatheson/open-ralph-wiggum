@@ -129,6 +129,8 @@ Options:
   --prompt-file, --file, -f  Read prompt content from a file
   --no-stream         Buffer agent output and print at the end
   --verbose-tools     Print every tool line (disable compact tool summary)
+  --dump-transcript   Persist raw per-iteration transcripts to `.ralph/` (or --transcript-dir)
+  --transcript-dir    Directory to write transcripts to (default: .ralph/)
   --no-plugins        Disable non-auth OpenCode plugins for this run (opencode only)
   --no-commit         Don't auto-commit after each iteration
   --allow-all         Auto-approve all tool permissions (default: on)
@@ -628,6 +630,8 @@ let allowAllPermissions = true;
 let promptFile = "";
 let streamOutput = true;
 let verboseTools = false;
+let dumpTranscript = false;
+let transcriptDir = "";
 let promptSource = "";
 
 const promptParts: string[] = [];
@@ -690,6 +694,15 @@ for (let i = 0; i < args.length; i++) {
     streamOutput = false;
   } else if (arg === "--stream") {
     streamOutput = true;
+  } else if (arg === "--dump-transcript") {
+    dumpTranscript = true;
+  } else if (arg === "--transcript-dir") {
+    const val = args[++i];
+    if (!val) {
+      console.error("Error: --transcript-dir requires a path");
+      process.exit(1);
+    }
+    transcriptDir = val;
   } else if (arg === "--verbose-tools") {
     verboseTools = true;
   } else if (arg === "--no-commit") {
@@ -1121,14 +1134,21 @@ async function streamProcessOutput(
     heartbeatIntervalMs: number;
     iterationStart: number;
     agent: AgentConfig;
+    idleTimeoutMs?: number;
   },
-): Promise<{ stdoutText: string; stderrText: string; toolCounts: Map<string, number> }> {
+): Promise<{
+  stdoutText: string;
+  stderrText: string;
+  toolCounts: Map<string, number>;
+  killedDueToIdle?: boolean;
+}> {
   const toolCounts = new Map<string, number>();
   let stdoutText = "";
   let stderrText = "";
   let lastPrintedAt = Date.now();
   let lastActivityAt = Date.now();
   let lastToolSummaryAt = 0;
+  let killedDueToIdle = false;
 
   const compactTools = options.compactTools;
   const parseToolOutput = options.agent.parseToolOutput;
@@ -1213,12 +1233,39 @@ async function streamProcessOutput(
     }
   }, options.heartbeatIntervalMs);
 
+  // Idle timeout: kill the process after a period of no stdout/stderr activity
+  let idleTimer: NodeJS.Timeout | null = null;
+  const startIdleTimer = () => {
+    if (!options.idleTimeoutMs || options.idleTimeoutMs <= 0) return;
+    if (idleTimer) clearInterval(idleTimer);
+    idleTimer = setInterval(() => {
+      const now = Date.now();
+      if (now - lastActivityAt >= (options.idleTimeoutMs ?? 0)) {
+        try {
+          proc.kill();
+          killedDueToIdle = true;
+          console.warn(`\n⚠️  Agent killed after ${Math.floor((options.idleTimeoutMs ?? 0) / 1000)}s of inactivity.`);
+        } catch (e) {
+          // ignore
+        }
+        if (idleTimer) {
+          clearInterval(idleTimer);
+          idleTimer = null;
+        }
+      }
+    }, Math.max(1000, Math.min(10000, options.idleTimeoutMs ?? 1000)));
+  };
+  // Start idle timer
+  startIdleTimer();
+
   try {
-    await Promise.all([
+      await Promise.all([
       streamText(
         proc.stdout,
         chunk => {
           stdoutText += chunk;
+          // reset idle timer on activity
+          lastActivityAt = Date.now();
         },
         false,
       ),
@@ -1226,19 +1273,25 @@ async function streamProcessOutput(
         proc.stderr,
         chunk => {
           stderrText += chunk;
+          // reset idle timer on activity
+          lastActivityAt = Date.now();
         },
         true,
       ),
     ]);
   } finally {
     clearInterval(heartbeatTimer);
+    if (idleTimer) {
+      clearInterval(idleTimer);
+      idleTimer = null;
+    }
   }
 
   if (compactTools) {
     maybePrintToolSummary(true);
   }
 
-  return { stdoutText, stderrText, toolCounts };
+  return { stdoutText, stderrText, toolCounts, killedDueToIdle };
 }
 // Main loop
 // Helper to detect per-iteration file changes using content hashes
@@ -1500,10 +1553,15 @@ async function runRalphLoop(): Promise<void> {
           heartbeatIntervalMs: 10000,
           iterationStart,
           agent: agentConfig,
+          idleTimeoutMs: 3 * 60 * 1000, // default 3 minutes
         });
         result = streamed.stdoutText;
         stderr = streamed.stderrText;
         toolCounts = streamed.toolCounts;
+        // If the process was killed due to idle, write transcript so user can inspect
+        if (streamed.killedDueToIdle) {
+          console.log(`\nℹ️  Agent killed due to idle timeout. Transcript will be saved if enabled.`);
+        }
       } else {
         const stdoutPromise = new Response(proc.stdout).text();
         const stderrPromise = new Response(proc.stderr).text();
@@ -1513,6 +1571,26 @@ async function runRalphLoop(): Promise<void> {
 
       const exitCode = await exitCodePromise;
       currentProc = null; // Clear reference after subprocess completes
+
+      // Persist per-iteration transcripts if requested
+      try {
+        const transcriptsEnabled = dumpTranscript || transcriptDir !== "";
+        if (transcriptsEnabled) {
+          const dir = transcriptDir || stateDir;
+          if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+          const safeIter = state.iteration;
+          const outPath = join(dir, `iteration-${safeIter}.log`);
+          const errPath = join(dir, `iteration-${safeIter}.err.log`);
+          const meta = `Iteration: ${safeIter}\nStarted: ${new Date(iterationStart).toISOString()}\nEnded: ${new Date().toISOString()}\nExitCode: ${exitCode}\n\n--- STDOUT ---\n`;
+          writeFileSync(outPath, meta + (result || "") + "\n\n--- STDERR ---\n" + (stderr || ""));
+          try {
+            if (stderr && stderr.trim()) writeFileSync(errPath, stderr);
+          } catch {}
+          console.log(`\n📄 Transcript written: ${outPath}`);
+        }
+      } catch (e) {
+        // ignore transcript write errors
+      }
 
       if (!streamOutput) {
         if (stderr) {
